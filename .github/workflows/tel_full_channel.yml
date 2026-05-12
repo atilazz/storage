@@ -21,6 +21,12 @@ on:
         type: number
         default: 90
 
+      delete_after_download:
+        description: 'Delete from channel after download? (true/false)'
+        required: false
+        type: boolean
+        default: false
+
 permissions:
   contents: write
 
@@ -46,6 +52,7 @@ jobs:
           CHANNEL: ${{ github.event.inputs.channel }}
           LIMIT: ${{ github.event.inputs.limit }}
           SPLIT_SIZE: ${{ github.event.inputs.split_size }}
+          DELETE_AFTER: ${{ github.event.inputs.delete_after_download }}
 
         run: |
 
@@ -69,54 +76,92 @@ jobs:
           CHANNEL = os.environ["CHANNEL"] or "https://t.me/mychonel"
           LIMIT = int(os.environ["LIMIT"])
           SPLIT_SIZE = int(os.environ["SPLIT_SIZE"])
+          DELETE_AFTER = os.environ.get("DELETE_AFTER", "false").lower() == "true"
 
-          # استفاده از پوشه dl به جای downloads
           DOWNLOAD_DIR = "dl"
           os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
           split_lock = asyncio.Lock()
+          downloaded_ids = set()
+
+          # بارگذاری IDهای قبلی دانلود شده
+          LOG_FILE = os.path.join(DOWNLOAD_DIR, ".downloaded_ids.txt")
+          if os.path.exists(LOG_FILE):
+              with open(LOG_FILE, "r") as f:
+                  downloaded_ids = set(line.strip() for line in f)
 
           def safe(name):
+              # جایگزینی کاراکترهای غیرمجاز
               return re.sub(r'[\\/*?:"<>|]', "_", name)
 
-          def short_hash(text):
-              return hashlib.md5(text.encode()).hexdigest()[:6]
-
-          def get_filename(msg, msg_id):
-              base = None
-
-              if hasattr(msg, "file") and msg.file and getattr(msg.file, "name", None):
-                  base = msg.file.name
-
-              if msg.document:
+          def get_filename(msg):
+              """دریافت نام صحیح فایل از پیام تلگرام"""
+              file_name = None
+              
+              # روش 1: بررسی msg.file.name
+              if hasattr(msg, 'file') and msg.file and msg.file.name:
+                  file_name = msg.file.name
+              
+              # روش 2: بررسی DocumentAttributeFilename
+              if not file_name and msg.document:
                   for attr in msg.document.attributes:
-                      if isinstance(attr, DocumentAttributeFilename):
-                          base = attr.file_name
-
-              if msg.video:
-                  ext = msg.file.ext if msg.file and msg.file.ext else ".mp4"
-                  base = f"{msg_id}{ext}"
-
-              if msg.audio:
-                  ext = msg.file.ext if msg.file and msg.file.ext else ".mp3"
-                  base = f"{msg_id}{ext}"
-
-              if msg.file and not base:
-                  ext = msg.file.ext if msg.file.ext else ".bin"
-                  base = f"{msg_id}{ext}"
-
-              if not base:
-                  base = f"{msg_id}.bin"
-
-              base = safe(base)
-
-              # جلوگیری از نام تکراری
-              full_path = os.path.join(DOWNLOAD_DIR, base)
-              if os.path.exists(full_path):
-                  name, ext = os.path.splitext(base)
-                  base = f"{name}_{short_hash(str(msg_id))}{ext}"
-
-              return base
+                      if isinstance(attr, DocumentAttributeFilename) and attr.file_name:
+                          file_name = attr.file_name
+                          break
+              
+              # روش 3: بررسی message media
+              if not file_name and hasattr(msg, 'media') and msg.media:
+                  if hasattr(msg.media, 'document'):
+                      for attr in msg.media.document.attributes:
+                          if isinstance(attr, DocumentAttributeFilename) and attr.file_name:
+                              file_name = attr.file_name
+                              break
+              
+              # روش 4: ساخت نام بر اساس نوع فایل
+              if not file_name:
+                  if msg.video:
+                      file_name = f"video_{msg.id}.mp4"
+                  elif msg.audio:
+                      # استخراج نام آهنگ از فایل صوتی
+                      if hasattr(msg.audio, 'title') and msg.audio.title:
+                          file_name = f"{msg.audio.title}.mp3"
+                      elif hasattr(msg.audio, 'performer') and msg.audio.performer:
+                          file_name = f"{msg.audio.performer}.mp3"
+                      else:
+                          file_name = f"audio_{msg.id}.mp3"
+                  elif msg.document:
+                      mime = msg.document.mime_type if msg.document else ""
+                      if "pdf" in mime:
+                          file_name = f"doc_{msg.id}.pdf"
+                      elif "zip" in mime:
+                          file_name = f"file_{msg.id}.zip"
+                      else:
+                          file_name = f"file_{msg.id}.bin"
+                  else:
+                      file_name = f"media_{msg.id}.bin"
+              
+              # حذف فاصله‌های اضافی و کاراکترهای خاص
+              file_name = safe(file_name.strip())
+              
+              # حذف فاصله از ابتدا و انتها
+              file_name = file_name.strip()
+              
+              # اگر اسم فایل پسوند ندارد، پسوند مناسب اضافه کن
+              if '.' not in file_name:
+                  if msg.video:
+                      file_name += '.mp4'
+                  elif msg.audio:
+                      file_name += '.mp3'
+              else:
+                  # اطمینان از اینکه پسوند فایل صحیح است
+                  ext = file_name.split('.')[-1].lower()
+                  if ext not in ['mp4', 'mkv', 'mp3', 'jpg', 'png', 'pdf', 'zip', 'rar', 'txt', 'bin']:
+                      if msg.video:
+                          file_name = file_name.rsplit('.', 1)[0] + '.mp4'
+                      elif msg.audio:
+                          file_name = file_name.rsplit('.', 1)[0] + '.mp3'
+              
+              return file_name
 
           async def split_file(path):
               async with split_lock:
@@ -149,18 +194,38 @@ jobs:
                   os.remove(path)
                   return True
 
+          async def delete_from_channel(client, msg):
+              if not DELETE_AFTER:
+                  print(f"🔒 delete disabled, keeping post {msg.id}")
+                  return
+              
+              try:
+                  await client.delete_messages(msg.chat_id, msg.id)
+                  print(f"🗑 deleted post {msg.id} from channel")
+              except Exception as e:
+                  print(f"⚠️ delete failed for {msg.id}: {e}")
+
           async def process_one(client, msg, i, total):
               if not msg.media:
                   return
 
-              name = get_filename(msg, msg.id)
-              path = os.path.join(DOWNLOAD_DIR, name)
-
-              if os.path.exists(path):
-                  print(f"⏭️ skip {name}")
+              # بررسی دانلود قبلی
+              if str(msg.id) in downloaded_ids:
+                  print(f"⏭️ already downloaded: post {msg.id}")
                   return
 
-              print(f"\n⬇️ [{i}/{total}] {name}")
+              name = get_filename(msg)
+              path = os.path.join(DOWNLOAD_DIR, name)
+
+              # اگه فایل همین اسم وجود داشت، یه عدد بهش اضافه کن
+              counter = 1
+              original_path = path
+              while os.path.exists(path):
+                  name, ext = os.path.splitext(original_path)
+                  path = f"{name}_{counter}{ext}"
+                  counter += 1
+
+              print(f"\n⬇️ [{i}/{total}] {name} (post {msg.id})")
 
               start = time.time()
               last = 0
@@ -185,16 +250,28 @@ jobs:
 
               try:
                   await client.download_media(msg, file=path, progress_callback=progress)
-                  print("\n✅ downloaded")
+                  print(f"\n✅ downloaded: {name}")
+
+                  # ذخیره ID در لیست دانلود شده‌ها
+                  downloaded_ids.add(str(msg.id))
+                  with open(LOG_FILE, "a") as f:
+                      f.write(f"{msg.id}\n")
 
                   await split_file(path)
 
+                  # حذف از کانال (فقط اگه گزینه فعال باشه)
+                  await delete_from_channel(client, msg)
+
               except Exception as e:
-                  print(f"\n❌ error {e}")
+                  print(f"\n❌ error downloading {name}: {e}")
 
           async def main():
               client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
               await client.start()
+
+              print(f"✅ connected to Telegram")
+              print(f"📁 download folder: {DOWNLOAD_DIR}")
+              print(f"🗑 delete after download: {DELETE_AFTER}")
 
               entity = await client.get_entity(CHANNEL)
 
@@ -206,21 +283,26 @@ jobs:
               messages = [m for m in messages if m.media]
               total = len(messages)
 
-              print(f"📦 {total} media posts found")
+              print(f"📦 {total} media posts found in channel")
+              print(f"📝 already downloaded: {len(downloaded_ids)} posts")
+
+              # فقط پیام‌های جدید
+              new_messages = [m for m in messages if str(m.id) not in downloaded_ids]
+              print(f"🆕 new posts to download: {len(new_messages)}")
 
               sem = asyncio.Semaphore(3)
 
               async def worker(msg, i):
                   async with sem:
-                      await process_one(client, msg, i, total)
+                      await process_one(client, msg, i, len(new_messages))
 
               await asyncio.gather(*[
                   worker(msg, i+1)
-                  for i, msg in enumerate(reversed(messages))
+                  for i, msg in enumerate(new_messages)
               ])
 
               await client.disconnect()
-              print("\n🎉 DONE - all files saved in 'dl' folder")
+              print(f"\n🎉 DONE - {len(new_messages)} files saved in '{DOWNLOAD_DIR}' folder")
 
           asyncio.run(main())
 
