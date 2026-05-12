@@ -47,10 +47,6 @@ jobs:
           LIMIT: ${{ github.event.inputs.limit }}
           SPLIT_SIZE: ${{ github.event.inputs.split_size }}
 
-          TARGET_USER: ${{ secrets.TARGET_USER }}
-          TARGET_TOKEN: ${{ secrets.TARGET_TOKEN }}
-          TARGET_REPO: ${{ secrets.TARGET_REPO }}
-
         run: |
 
           python3 << 'EOF'
@@ -60,8 +56,6 @@ jobs:
           import re
           import time
           import math
-          import shutil
-          import subprocess
           import hashlib
 
           from telethon import TelegramClient
@@ -76,17 +70,11 @@ jobs:
           LIMIT = int(os.environ["LIMIT"])
           SPLIT_SIZE = int(os.environ["SPLIT_SIZE"])
 
-          TARGET_USER = os.environ["TARGET_USER"]
-          TARGET_TOKEN = os.environ["TARGET_TOKEN"]
-          TARGET_REPO = os.environ["TARGET_REPO"]
+          # استفاده از پوشه dl به جای downloads
+          DOWNLOAD_DIR = "dl"
+          os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-          os.makedirs("downloads", exist_ok=True)
-
-          push_lock = asyncio.Lock()
           split_lock = asyncio.Lock()
-
-          downloaded_count = 0
-          last_push_success = True   # ✅ FIX ADD
 
           def safe(name):
               return re.sub(r'[\\/*?:"<>|]', "_", name)
@@ -95,7 +83,6 @@ jobs:
               return hashlib.md5(text.encode()).hexdigest()[:6]
 
           def get_filename(msg, msg_id):
-
               base = None
 
               if hasattr(msg, "file") and msg.file and getattr(msg.file, "name", None):
@@ -123,16 +110,16 @@ jobs:
 
               base = safe(base)
 
-              if os.path.exists("downloads/" + base):
+              # جلوگیری از نام تکراری
+              full_path = os.path.join(DOWNLOAD_DIR, base)
+              if os.path.exists(full_path):
                   name, ext = os.path.splitext(base)
                   base = f"{name}_{short_hash(str(msg_id))}{ext}"
 
               return base
 
           async def split_file(path):
-
               async with split_lock:
-
                   if not os.path.exists(path):
                       return False
 
@@ -145,18 +132,13 @@ jobs:
                   if size <= limit:
                       return True
 
-                  parts = []
                   total = math.ceil(size / limit)
 
                   with open(path, "rb") as f:
-
                       for i in range(total):
-
                           part = f"{path}.part{i+1:03d}"
-
                           with open(part, "wb") as out:
                               remaining = limit
-
                               while remaining > 0:
                                   chunk = f.read(min(1024*1024, remaining))
                                   if not chunk:
@@ -164,64 +146,15 @@ jobs:
                                   out.write(chunk)
                                   remaining -= len(chunk)
 
-                          parts.append(part)
-
                   os.remove(path)
                   return True
 
-          async def git_push():
-
-              global last_push_success
-
-              async with push_lock:
-
-                  print("\n🚀 pushing...")
-
-                  if os.path.exists("storage_repo"):
-                      shutil.rmtree("storage_repo")
-
-                  subprocess.run([
-                      "git","clone","--depth=1",
-                      f"https://{TARGET_USER}:{TARGET_TOKEN}@github.com/{TARGET_USER}/{TARGET_REPO}.git",
-                      "storage_repo"
-                  ], check=True)
-
-                  os.makedirs("storage_repo/downloads", exist_ok=True)
-
-                  subprocess.run("cp -r downloads/* storage_repo/downloads/ 2>/dev/null || true", shell=True)
-
-                  os.chdir("storage_repo")
-
-                  subprocess.run(["git","config","user.name","bot"])
-                  subprocess.run(["git","config","user.email","bot@users.noreply.github.com"])
-
-                  subprocess.run(["git","add","."])
-                  subprocess.run(["git","commit","-m","auto"], check=False)
-
-                  result = subprocess.run(["git","push","origin","main"], check=False)
-
-                  os.chdir("..")
-
-                  last_push_success = (result.returncode == 0)
-
-                  print("✅ push done:", last_push_success)
-
-          async def delete_from_channel(client, msg):
-              try:
-                  await client.delete_messages(msg.chat_id, msg.id)
-                  print(f"🗑 deleted {msg.id}")
-              except Exception as e:
-                  print(f"⚠️ delete failed: {e}")
-
           async def process_one(client, msg, i, total):
-
-              global downloaded_count
-
               if not msg.media:
                   return
 
               name = get_filename(msg, msg.id)
-              path = f"downloads/{name}"
+              path = os.path.join(DOWNLOAD_DIR, name)
 
               if os.path.exists(path):
                   print(f"⏭️ skip {name}")
@@ -233,12 +166,9 @@ jobs:
               last = 0
 
               def progress(cur, total_size):
-
                   nonlocal last
-
                   if time.time() - last < 0.3:
                       return
-
                   last = time.time()
 
                   if total_size == 0:
@@ -254,36 +184,16 @@ jobs:
                   )
 
               try:
-
                   await client.download_media(msg, file=path, progress_callback=progress)
-
                   print("\n✅ downloaded")
 
-                  ok = await split_file(path)
-
-                  if ok:
-                      downloaded_count += 1
-
-                      if downloaded_count % 5 == 0:
-                          await git_push()
-
-                      # ✅ FIXED DELETE LOGIC
-                      if last_push_success:
-                          await delete_from_channel(client, msg)
-                      else:
-                          print("⚠️ skip delete (push failed)")
+                  await split_file(path)
 
               except Exception as e:
                   print(f"\n❌ error {e}")
 
           async def main():
-
-              client = TelegramClient(
-                  StringSession(SESSION),
-                  API_ID,
-                  API_HASH
-              )
-
+              client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
               await client.start()
 
               entity = await client.get_entity(CHANNEL)
@@ -294,10 +204,9 @@ jobs:
               )
 
               messages = [m for m in messages if m.media]
-
               total = len(messages)
 
-              print(f"📦 {total} media posts")
+              print(f"📦 {total} media posts found")
 
               sem = asyncio.Semaphore(3)
 
@@ -311,10 +220,23 @@ jobs:
               ])
 
               await client.disconnect()
-              await git_push()
-
-              print("\n🎉 DONE")
+              print("\n🎉 DONE - all files saved in 'dl' folder")
 
           asyncio.run(main())
 
           EOF
+
+      - name: Commit and push to storage
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add dl/
+
+          if git diff --staged --quiet; then
+            echo "✅ no new files to commit"
+          else
+            git commit -m "telegram backup to dl folder [skip ci]"
+            git push origin main
+            echo "✅ changes pushed"
+          fi
