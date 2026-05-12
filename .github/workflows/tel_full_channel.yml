@@ -1,19 +1,19 @@
-
-name: Telegram Bulk Downloader → Storage Repo
+name: دانلود کامل کانال تلگرام (PRO)
 
 on:
   workflow_dispatch:
     inputs:
-      links:
-        description: 'Telegram links separated by ;'
+      channel_username:
         required: true
         type: string
-
-      split_size:
-        description: 'Split size MB (0 = no split)'
+      max_posts:
         required: false
         type: number
-        default: 90
+        default: 0
+      split_size_mb:
+        required: false
+        type: number
+        default: 88
 
 permissions:
   contents: write
@@ -23,242 +23,186 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 📥 Checkout main repo
+      - name: 📥 checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: 🐍 Install dependencies
+      - name: 🐍 install
         run: |
-          sudo apt-get update
-          sudo apt-get install -y python3 python3-pip git
-          pip3 install telethon
+          pip install telethon tqdm
 
-      - name: 🚀 Download Telegram files (with progress)
+      - name: 📦 download channel
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
-          LINKS: ${{ github.event.inputs.links }}
-          SPLIT_SIZE: ${{ github.event.inputs.split_size }}
-        run: |
+          SESSION_STRING: ${{ secrets.SESSION_STRING }}
+          CHANNEL: ${{ github.event.inputs.channel_username }}
+          MAX_POSTS: ${{ github.event.inputs.max_posts }}
+          SPLIT: ${{ github.event.inputs.split_size_mb }}
 
+        run: |
           python3 << 'EOF'
 
-          import asyncio
           import os
           import re
-          import time
           import math
-
+          import asyncio
           from telethon import TelegramClient
-          from telethon.tl.types import DocumentAttributeFilename
+          from telethon.sessions import StringSession
 
-          API_ID = int(os.environ['API_ID'])
-          API_HASH = os.environ['API_HASH']
-          BOT_TOKEN = os.environ['BOT_TOKEN']
-          CHANNEL_ID = int(os.environ['CHANNEL_ID'])
+          API_ID = int(os.environ["API_ID"])
+          API_HASH = os.environ["API_HASH"]
+          SESSION = os.environ["SESSION_STRING"]
 
-          LINKS = [x.strip() for x in os.environ['LINKS'].split(';') if x.strip()]
-          SPLIT_SIZE = int(os.environ['SPLIT_SIZE'])
+          CHANNEL = os.environ["CHANNEL"]
+          MAX_POSTS = int(os.environ["MAX_POSTS"])
+          SPLIT = int(os.environ["SPLIT"])
 
-          os.makedirs("downloads", exist_ok=True)
+          def safe(n):
+              # حذف کاراکترهای غیرمجاز و جلوگیری از اسم‌های خیلی بلند
+              if not n:
+                  n = "file"
+              name = re.sub(r'[\\/*?:"<>|]', "_", str(n))
+              # محدود کردن طول نام فایل
+              if len(name) > 200:
+                  name = name[:200]
+              return name
 
-          def extract_id(link):
-              m = re.search(r'/(\d+)$', link)
-              return int(m.group(1)) if m else None
-
-          def safe(name):
-              return re.sub(r'[\\/*?:"<>|]', "_", name)
-
-            # ========== تابع دریافت نام فایل - نسخه نهایی ==========
-          def get_filename(msg, msg_id):
-              # بررسی مستقیم filename
-              if hasattr(msg, 'file') and msg.file and hasattr(msg.file, 'name') and msg.file.name:
-                  if msg.file.name.endswith(('.mp4', '.mkv', '.jpg', '.png', '.pdf', '.zip', '.rar')):
-                      return msg.file.name
-              
-              # بررسی DocumentAttributeFilename
-              if msg.document:
-                  for attr in msg.document.attributes:
-                      if isinstance(attr, DocumentAttributeFilename) and attr.file_name:
-                          if attr.file_name.endswith(('.mp4', '.mkv', '.jpg', '.png', '.pdf', '.zip', '.rar')):
-                              return attr.file_name
-                          # حتی اگه پسوند نداره قبول کن
-                          if '.' in attr.file_name:
-                              return attr.file_name
-              
-              # بررسی در media.document
-              if hasattr(msg, 'media') and msg.media:
-                  if hasattr(msg.media, 'document'):
-                      for attr in msg.media.document.attributes:
-                          if isinstance(attr, DocumentAttributeFilename) and attr.file_name:
-                              return attr.file_name
-              
-              # ویدیو
-              if msg.video:
-                  ext = msg.file.ext if msg.file and msg.file.ext else ".mp4"
-                  return f"{msg_id}{ext}"
-              
-              # صدا
-              if msg.audio:
-                  ext = msg.file.ext if msg.file and msg.file.ext else ".mp3"
-                  return f"{msg_id}{ext}"
-              
-              # فایل بدون اسم
-              if msg.file:
-                  ext = msg.file.ext if msg.file.ext else ".bin"
-                  return f"{msg_id}{ext}"
-              
-              return f"{msg_id}.bin"
-          # ==================================================
-
-          async def split_file(path):
-
-              if SPLIT_SIZE == 0:
-                  return [path]
-
-              limit = SPLIT_SIZE * 1024 * 1024
+          async def split_file(path, limit_mb):
               size = os.path.getsize(path)
+              limit = limit_mb * 1024 * 1024
 
               if size <= limit:
                   return [path]
 
-              parts = []
-              total = math.ceil(size / limit)
+              parts = math.ceil(size / limit)
+              out = []
 
               with open(path, "rb") as f:
+                  for i in range(parts):
+                      p = f"{path}.part{i+1:03d}"
+                      out.append(p)
 
-                  for i in range(total):
-
-                      part = f"{path}.part{i+1:03d}"
-
-                      with open(part, "wb") as out:
-
-                          remaining = limit
-
-                          while remaining > 0:
-
-                              chunk = f.read(min(1024*1024, remaining))
-
+                      with open(p, "wb") as o:
+                          left = limit
+                          while left > 0:
+                              chunk = f.read(min(left, 1024*1024))
                               if not chunk:
                                   break
+                              o.write(chunk)
+                              left -= len(chunk)
 
-                              out.write(chunk)
-                              remaining -= len(chunk)
+              # حذف فایل اصلی بعد از تقسیم
+              try:
+                  os.remove(path)
+              except:
+                  pass
 
-                      parts.append(part)
-
-              os.remove(path)
-
-              return parts
-
-          async def download(client, link, i, total):
-
-              msg_id = extract_id(link)
-
-              if not msg_id:
-                  print("❌ invalid link")
-                  return
-
-              msg = await client.get_messages(CHANNEL_ID, ids=msg_id)
-
-              if not msg or not msg.media:
-                  print("⚠️ no media")
-                  return
-
-              name = safe(get_filename(msg, msg_id))
-              path = f"downloads/{name}"
-
-              if os.path.exists(path):
-                  print(f"⏭️ skip: {name}")
-                  return
-
-              print(f"\n⬇️ [{i}/{total}] {name}")
-
-              start = time.time()
-
-              def progress(cur, total_size):
-
-                  if total_size == 0:
-                      return
-
-                  percent = cur / total_size * 100
-                  speed = cur / (time.time() - start + 0.1) / 1024 / 1024
-
-                  print(
-                      f"\r📥 {name} | "
-                      f"{percent:.1f}% | "
-                      f"{cur/1024/1024:.1f}/{total_size/1024/1024:.1f}MB | "
-                      f"{speed:.2f} MB/s",
-                      end=""
-                  )
-
-              await client.download_media(
-                  msg,
-                  file=path,
-                  progress_callback=progress
-              )
-
-              print("\n✅ done")
-
-              await split_file(path)
+              return out
 
           async def main():
+              # استفاده از کلاینت با session string
+              client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 
-              client = TelegramClient(
-                  "session",
-                  API_ID,
-                  API_HASH
-              )
+              await client.start()
 
-              await client.start(bot_token=BOT_TOKEN)
+              print("✅ connected to Telegram")
 
-              total = len(LINKS)
+              # تبدیل نام کاربری یا لینک به entity
+              try:
+                  entity = await client.get_entity(CHANNEL)
+              except Exception as e:
+                  print(f"❌ cannot find channel: {e}")
+                  return
 
-              print(f"📦 {total} links")
+              posts = []
 
-              sem = asyncio.Semaphore(3)
+              print("🔄 reading messages from channel...")
 
-              async def wrap(l, i):
-                  async with sem:
-                      await download(client, l, i, total)
+              try:
+                  async for msg in client.iter_messages(entity, limit=MAX_POSTS if MAX_POSTS > 0 else None):
+                      if msg.file:
+                          posts.append(msg)
+                  print(f"📦 {len(posts)} messages with file found")
+              except Exception as e:
+                  print(f"❌ error reading messages: {e}")
+                  return
 
-              await asyncio.gather(*[
-                  wrap(l, i+1)
-                  for i, l in enumerate(LINKS)
-              ])
+              if not posts:
+                  print("⚠️ no messages with file found")
+                  return
+
+              os.makedirs("downloads", exist_ok=True)
+
+              for i, msg in enumerate(posts, 1):
+                  # استخراج نام فایل
+                  if msg.file and msg.file.name:
+                      raw_name = msg.file.name
+                  else:
+                      raw_name = f"msg_{msg.id}"
+
+                  # استخراج پسوند
+                  match = re.search(r'\.([^.]+\.[^.]+$|tar\.\w+|zip|rar|7z|pdf|jpg|png|mp4|mkv|bin)$', raw_name, re.IGNORECASE)
+                  if match:
+                      ext = match.group(1)
+                      base_name = raw_name[:-(len(ext)+1)]
+                  else:
+                      base_name = raw_name
+                      ext = "bin"
+
+                  clean_base = safe(base_name)
+                  name = f"{clean_base}.{ext}" if ext else clean_base
+
+                  path = f"downloads/{name}"
+
+                  if os.path.exists(path):
+                      print(f"⏭️ skip: {name}")
+                      continue
+
+                  print(f"⬇️ [{i}/{len(posts)}] {name}")
+
+                  try:
+                      # دانلود فایل
+                      p = await client.download_media(msg, path)
+
+                      if p and os.path.exists(p):
+                          # تقسیم فایل در صورت نیاز
+                          await split_file(p, SPLIT)
+                      else:
+                          print(f"⚠️ download failed: {name}")
+                  except Exception as e:
+                      print(f"❌ error downloading {name}: {e}")
 
               await client.disconnect()
+              print("✅ done")
 
           asyncio.run(main())
 
           EOF
 
-      - name: 📤 Push to storage repo
-        env:
-          TARGET_USER: ${{ secrets.TARGET_USER }}
-          TARGET_TOKEN: ${{ secrets.TARGET_TOKEN }}
-          TARGET_REPO: ${{ secrets.TARGET_REPO }}
-
+      - name: 🔧 fix large file naming and remove temp files
         run: |
+          # حذف فایل‌های موقتی ناخواسته
+          find downloads -type f -name "*.part.*" ! -name "*part*" -delete 2>/dev/null || true
+          find downloads -type f -size 0 -delete 2>/dev/null || true
 
-          echo "📦 Cloning storage repo..."
-
-          git clone https://$TARGET_USER:$TARGET_TOKEN@github.com/$TARGET_USER/$TARGET_REPO.git storage_repo
-
-          mkdir -p storage_repo/downloads
-
-          cp -r downloads/* storage_repo/downloads/ 2>/dev/null || true
-
-          cd storage_repo
-
+      - name: 🔄 git pull and push with conflict resolve
+        run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add .
+          # دریافت تغییرات جدید
+          git pull --rebase origin main --autostash || true
 
-          git commit -m "telegram auto sync [skip ci]" || echo "no changes"
+          # افزودن فایل‌های دانلود شده
+          git add downloads/
 
-          git push origin main
-
-          echo "✅ pushed to storage repo"
+          # ساخت commit در صورت وجود تغییر
+          if git diff --staged --quiet; then
+            echo "✅ no new files to commit"
+          else
+            git commit -m "telegram backup $(date '+%Y-%m-%d %H:%M:%S') [skip ci]"
+            git push origin main
+            echo "✅ changes pushed"
+          fi
