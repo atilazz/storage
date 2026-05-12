@@ -50,17 +50,52 @@ jobs:
             -o "dl/${{ steps.filename.outputs.file_name }}" \
             "${{ github.event.inputs.download_url }}"
 
-      - name: 📊 Show file info
+      - name: 📊 Check file size and split if needed
+        id: split
         run: |
           FILE="dl/${{ steps.filename.outputs.file_name }}"
+          SPLIT_SIZE=90  # حداکثر حجم هر قسمت (مگابایت)
+          
           if [ -f "$FILE" ]; then
             SIZE=$(stat -c%s "$FILE" 2>/dev/null || stat -f%z "$FILE" 2>/dev/null)
-            echo "✅ فایل دانلود شد: ${{ steps.filename.outputs.file_name }}"
-            echo "📦 حجم: $((SIZE / 1024 / 1024)) MB"
+            SIZE_MB=$((SIZE / 1024 / 1024))
+            LIMIT_BYTES=$((SPLIT_SIZE * 1024 * 1024))
+            
+            echo "📦 حجم فایل اصلی: ${SIZE_MB} MB"
+            
+            if [ $SIZE -gt $LIMIT_BYTES ]; then
+              echo "⚠️ فایل بزرگتر از ${SPLIT_SIZE} MB است، تقسیم می‌شود..."
+              
+              # تقسیم فایل به قسمت‌های SPLIT_SIZE مگابایتی
+              cd dl
+              split -b ${SPLIT_SIZE}M "${{ steps.filename.outputs.file_name }}" "${{ steps.filename.outputs.file_name }}.part."
+              
+              # حذف فایل اصلی
+              rm "${{ steps.filename.outputs.file_name }}"
+              
+              # شمارش تعداد قسمت‌ها
+              PART_COUNT=$(ls -1 "${{ steps.filename.outputs.file_name }}.part."* 2>/dev/null | wc -l)
+              echo "✅ فایل به ${PART_COUNT} قسمت ${SPLIT_SIZE} مگابایتی تقسیم شد"
+              echo "split_done=true" >> $GITHUB_OUTPUT
+              cd ..
+            else
+              echo "✅ فایل کوچکتر از ${SPLIT_SIZE} MB است، بدون تغییر می‌ماند"
+              echo "split_done=false" >> $GITHUB_OUTPUT
+            fi
           else
-            echo "❌ فایل دانلود نشد!"
+            echo "❌ فایل یافت نشد!"
             exit 1
           fi
+
+      - name: 📊 Show file info
+        run: |
+          echo "📁 محتویات پوشه dl:"
+          ls -lh dl/
+          
+          TOTAL_SIZE=$(du -sh dl/ | cut -f1)
+          FILE_COUNT=$(ls -1 dl/ | wc -l)
+          echo "📦 مجموع حجم: ${TOTAL_SIZE}"
+          echo "📄 تعداد فایل‌ها: ${FILE_COUNT}"
 
       - name: 📤 Commit and push to repository
         run: |
