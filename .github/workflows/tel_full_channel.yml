@@ -22,7 +22,7 @@ on:
         default: 90
 
       delete_after_download:
-        description: 'Delete from channel after successful upload? (true/false)'
+        description: 'Delete from channel after download? (true/false)'
         required: false
         type: boolean
         default: false
@@ -36,8 +36,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Install
         run: |
@@ -50,10 +48,12 @@ jobs:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           SESSION: ${{ secrets.TG_SESSION }}
+
           CHANNEL: ${{ github.event.inputs.channel }}
           LIMIT: ${{ github.event.inputs.limit }}
           SPLIT_SIZE: ${{ github.event.inputs.split_size }}
           DELETE_AFTER: ${{ github.event.inputs.delete_after_download }}
+
         run: |
 
           python3 << 'EOF'
@@ -82,35 +82,86 @@ jobs:
           os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
           split_lock = asyncio.Lock()
-          successfully_downloaded = []
+          downloaded_ids = set()
+
+          # بارگذاری IDهای قبلی دانلود شده
+          LOG_FILE = os.path.join(DOWNLOAD_DIR, ".downloaded_ids.txt")
+          if os.path.exists(LOG_FILE):
+              with open(LOG_FILE, "r") as f:
+                  downloaded_ids = set(line.strip() for line in f)
 
           def safe(name):
+              # جایگزینی کاراکترهای غیرمجاز
               return re.sub(r'[\\/*?:"<>|]', "_", name)
 
           def get_filename(msg):
+              """دریافت نام صحیح فایل از پیام تلگرام"""
               file_name = None
-
+              
+              # روش 1: بررسی msg.file.name
               if hasattr(msg, 'file') and msg.file and msg.file.name:
                   file_name = msg.file.name
-
+              
+              # روش 2: بررسی DocumentAttributeFilename
               if not file_name and msg.document:
                   for attr in msg.document.attributes:
                       if isinstance(attr, DocumentAttributeFilename) and attr.file_name:
                           file_name = attr.file_name
                           break
-
+              
+              # روش 3: بررسی message media
+              if not file_name and hasattr(msg, 'media') and msg.media:
+                  if hasattr(msg.media, 'document'):
+                      for attr in msg.media.document.attributes:
+                          if isinstance(attr, DocumentAttributeFilename) and attr.file_name:
+                              file_name = attr.file_name
+                              break
+              
+              # روش 4: ساخت نام بر اساس نوع فایل
               if not file_name:
                   if msg.video:
                       file_name = f"video_{msg.id}.mp4"
                   elif msg.audio:
+                      # استخراج نام آهنگ از فایل صوتی
                       if hasattr(msg.audio, 'title') and msg.audio.title:
                           file_name = f"{msg.audio.title}.mp3"
+                      elif hasattr(msg.audio, 'performer') and msg.audio.performer:
+                          file_name = f"{msg.audio.performer}.mp3"
                       else:
                           file_name = f"audio_{msg.id}.mp3"
+                  elif msg.document:
+                      mime = msg.document.mime_type if msg.document else ""
+                      if "pdf" in mime:
+                          file_name = f"doc_{msg.id}.pdf"
+                      elif "zip" in mime:
+                          file_name = f"file_{msg.id}.zip"
+                      else:
+                          file_name = f"file_{msg.id}.bin"
                   else:
-                      file_name = f"file_{msg.id}.bin"
-
-              return safe(file_name.strip())
+                      file_name = f"media_{msg.id}.bin"
+              
+              # حذف فاصله‌های اضافی و کاراکترهای خاص
+              file_name = safe(file_name.strip())
+              
+              # حذف فاصله از ابتدا و انتها
+              file_name = file_name.strip()
+              
+              # اگر اسم فایل پسوند ندارد، پسوند مناسب اضافه کن
+              if '.' not in file_name:
+                  if msg.video:
+                      file_name += '.mp4'
+                  elif msg.audio:
+                      file_name += '.mp3'
+              else:
+                  # اطمینان از اینکه پسوند فایل صحیح است
+                  ext = file_name.split('.')[-1].lower()
+                  if ext not in ['mp4', 'mkv', 'mp3', 'jpg', 'png', 'pdf', 'zip', 'rar', 'txt', 'bin']:
+                      if msg.video:
+                          file_name = file_name.rsplit('.', 1)[0] + '.mp4'
+                      elif msg.audio:
+                          file_name = file_name.rsplit('.', 1)[0] + '.mp3'
+              
+              return file_name
 
           async def split_file(path):
               async with split_lock:
@@ -143,13 +194,30 @@ jobs:
                   os.remove(path)
                   return True
 
+          async def delete_from_channel(client, msg):
+              if not DELETE_AFTER:
+                  print(f"🔒 delete disabled, keeping post {msg.id}")
+                  return
+              
+              try:
+                  await client.delete_messages(msg.chat_id, msg.id)
+                  print(f"🗑 deleted post {msg.id} from channel")
+              except Exception as e:
+                  print(f"⚠️ delete failed for {msg.id}: {e}")
+
           async def process_one(client, msg, i, total):
               if not msg.media:
+                  return
+
+              # بررسی دانلود قبلی
+              if str(msg.id) in downloaded_ids:
+                  print(f"⏭️ already downloaded: post {msg.id}")
                   return
 
               name = get_filename(msg)
               path = os.path.join(DOWNLOAD_DIR, name)
 
+              # اگه فایل همین اسم وجود داشت، یه عدد بهش اضافه کن
               counter = 1
               original_path = path
               while os.path.exists(path):
@@ -173,30 +241,37 @@ jobs:
 
                   percent = cur * 100 / total_size
                   speed = cur / (time.time() - start + 0.001) / 1024 / 1024
-                  print(f"\r📥 {name} | {percent:.1f}% | {speed:.2f}MB/s", end="", flush=True)
+
+                  print(
+                      f"\r📥 {name} | {percent:.1f}% | {speed:.2f}MB/s",
+                      end="",
+                      flush=True
+                  )
 
               try:
                   await client.download_media(msg, file=path, progress_callback=progress)
                   print(f"\n✅ downloaded: {name}")
 
+                  # ذخیره ID در لیست دانلود شده‌ها
+                  downloaded_ids.add(str(msg.id))
+                  with open(LOG_FILE, "a") as f:
+                      f.write(f"{msg.id}\n")
+
                   await split_file(path)
 
-                  successfully_downloaded.append({
-                      "id": msg.id,
-                      "chat_id": msg.chat_id,
-                      "name": name
-                  })
+                  # حذف از کانال (فقط اگه گزینه فعال باشه)
+                  await delete_from_channel(client, msg)
+
               except Exception as e:
                   print(f"\n❌ error downloading {name}: {e}")
 
           async def main():
-              nonlocal successfully_downloaded
-
               client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
               await client.start()
 
               print(f"✅ connected to Telegram")
-              print(f"🗑 delete after successful upload: {DELETE_AFTER}")
+              print(f"📁 download folder: {DOWNLOAD_DIR}")
+              print(f"🗑 delete after download: {DELETE_AFTER}")
 
               entity = await client.get_entity(CHANNEL)
 
@@ -207,131 +282,43 @@ jobs:
 
               messages = [m for m in messages if m.media]
               total = len(messages)
-              print(f"📦 {total} media posts found")
+
+              print(f"📦 {total} media posts found in channel")
+              print(f"📝 already downloaded: {len(downloaded_ids)} posts")
+
+              # فقط پیام‌های جدید
+              new_messages = [m for m in messages if str(m.id) not in downloaded_ids]
+              print(f"🆕 new posts to download: {len(new_messages)}")
 
               sem = asyncio.Semaphore(3)
 
               async def worker(msg, i):
                   async with sem:
-                      await process_one(client, msg, i, total)
+                      await process_one(client, msg, i, len(new_messages))
 
               await asyncio.gather(*[
                   worker(msg, i+1)
-                  for i, msg in enumerate(messages)
+                  for i, msg in enumerate(new_messages)
               ])
 
               await client.disconnect()
-              print(f"\n🎉 Download phase complete. Successfully downloaded: {len(successfully_downloaded)} files")
-
-              # ذخیره ID پیام‌های موفق برای مرحله حذف
-              if successfully_downloaded and DELETE_AFTER:
-                  with open("successful_ids.txt", "w") as f:
-                      for item in successfully_downloaded:
-                          f.write(f"{item['id']}\n")
-                  print(f"📝 Saved {len(successfully_downloaded)} IDs for deletion")
+              print(f"\n🎉 DONE - {len(new_messages)} files saved in '{DOWNLOAD_DIR}' folder")
 
           asyncio.run(main())
 
           EOF
 
       - name: Commit and push to storage
-        id: git_push
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          echo "🔄 Fetching latest changes..."
-          git fetch origin main
 
           git add dl/
 
           if git diff --staged --quiet; then
             echo "✅ no new files to commit"
-            echo "push_success=true" >> $GITHUB_OUTPUT
           else
-            echo "📦 New files found, committing..."
             git commit -m "telegram backup to dl folder [skip ci]"
-
-            MAX_RETRIES=3
-            RETRY_COUNT=0
-            PUSH_SUCCESS=false
-
-            while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$PUSH_SUCCESS" = false ]; do
-              RETRY_COUNT=$((RETRY_COUNT+1))
-              echo "🔄 Push attempt $RETRY_COUNT/$MAX_RETRIES..."
-
-              if git push origin main; then
-                echo "✅ Push successful!"
-                PUSH_SUCCESS=true
-                echo "push_success=true" >> $GITHUB_OUTPUT
-              else
-                echo "⚠️ Push failed, pulling latest changes..."
-                git pull --rebase origin main
-                sleep 2
-              fi
-            done
-
-            if [ "$PUSH_SUCCESS" = false ]; then
-              echo "❌ Failed to push after $MAX_RETRIES attempts"
-              echo "push_success=false" >> $GITHUB_OUTPUT
-              exit 1
-            fi
+            git push origin main
+            echo "✅ changes pushed"
           fi
-
-      - name: Delete from Telegram channel (only if push succeeded and delete option is true)
-        if: github.event.inputs.delete_after_download == 'true' && steps.git_push.outputs.push_success == 'true'
-        env:
-          API_ID: ${{ secrets.API_ID }}
-          API_HASH: ${{ secrets.API_HASH }}
-          SESSION: ${{ secrets.TG_SESSION }}
-          CHANNEL: ${{ github.event.inputs.channel }}
-        run: |
-          python3 << 'EOF'
-          import asyncio
-          import os
-          from telethon import TelegramClient
-          from telethon.sessions import StringSession
-
-          async def delete_successful():
-              API_ID = int(os.environ["API_ID"])
-              API_HASH = os.environ["API_HASH"]
-              SESSION = os.environ["SESSION"]
-              CHANNEL = os.environ["CHANNEL"]
-
-              client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
-              await client.start()
-
-              print("✅ connected to Telegram for deletion")
-
-              if not os.path.exists("successful_ids.txt"):
-                  print("⚠️ No successful_ids.txt file found")
-                  return
-
-              with open("successful_ids.txt", "r") as f:
-                  ids = [int(line.strip()) for line in f if line.strip()]
-
-              if not ids:
-                  print("⚠️ No IDs to delete")
-                  return
-
-              print(f"🗑 Deleting {len(ids)} posts from channel...")
-              entity = await client.get_entity(CHANNEL)
-
-              deleted_count = 0
-              for msg_id in ids:
-                  try:
-                      await client.delete_messages(entity, msg_id)
-                      deleted_count += 1
-                      print(f"   ✅ deleted post {msg_id}")
-                  except Exception as e:
-                      print(f"   ❌ failed to delete {msg_id}: {e}")
-
-              print(f"🎉 Deleted {deleted_count} posts successfully")
-
-              # حذف فایل IDs بعد از اتمام
-              os.remove("successful_ids.txt")
-              await client.disconnect()
-
-          asyncio.run(delete_successful())
-          EOF
-        continue-on-error: true
