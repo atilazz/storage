@@ -25,8 +25,6 @@ jobs:
     steps:
       - name: 📥 checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: 🐍 install
         run: |
@@ -60,14 +58,7 @@ jobs:
           SPLIT = int(os.environ["SPLIT"])
 
           def safe(n):
-              # حذف کاراکترهای غیرمجاز و جلوگیری از اسم‌های خیلی بلند
-              if not n:
-                  n = "file"
-              name = re.sub(r'[\\/*?:"<>|]', "_", str(n))
-              # محدود کردن طول نام فایل
-              if len(name) > 200:
-                  name = name[:200]
-              return name
+              return re.sub(r'[\\/*?:"<>|]', "_", n)
 
           async def split_file(path, limit_mb):
               size = os.path.getsize(path)
@@ -93,116 +84,63 @@ jobs:
                               o.write(chunk)
                               left -= len(chunk)
 
-              # حذف فایل اصلی بعد از تقسیم
-              try:
-                  os.remove(path)
-              except:
-                  pass
-
+              os.remove(path)
               return out
 
           async def main():
-              # استفاده از کلاینت با session string
               client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
 
               await client.start()
 
-              print("✅ connected to Telegram")
+              print("✅ connected")
 
-              # تبدیل نام کاربری یا لینک به entity
-              try:
-                  entity = await client.get_entity(CHANNEL)
-              except Exception as e:
-                  print(f"❌ cannot find channel: {e}")
-                  return
+              entity = await client.get_entity(CHANNEL)
 
               posts = []
 
-              print("🔄 reading messages from channel...")
+              print("🔄 reading messages...")
 
-              try:
-                  async for msg in client.iter_messages(entity, limit=MAX_POSTS if MAX_POSTS > 0 else None):
-                      if msg.file:
-                          posts.append(msg)
-                  print(f"📦 {len(posts)} messages with file found")
-              except Exception as e:
-                  print(f"❌ error reading messages: {e}")
-                  return
+              async for msg in client.iter_messages(entity, limit=MAX_POSTS or None):
+                  if msg.file:
+                      posts.append(msg)
 
-              if not posts:
-                  print("⚠️ no messages with file found")
-                  return
+              print("📦 files:", len(posts))
 
               os.makedirs("downloads", exist_ok=True)
 
               for i, msg in enumerate(posts, 1):
-                  # استخراج نام فایل
-                  if msg.file and msg.file.name:
-                      raw_name = msg.file.name
-                  else:
-                      raw_name = f"msg_{msg.id}"
 
-                  # استخراج پسوند
-                  match = re.search(r'\.([^.]+\.[^.]+$|tar\.\w+|zip|rar|7z|pdf|jpg|png|mp4|mkv|bin)$', raw_name, re.IGNORECASE)
-                  if match:
-                      ext = match.group(1)
-                      base_name = raw_name[:-(len(ext)+1)]
-                  else:
-                      base_name = raw_name
-                      ext = "bin"
-
-                  clean_base = safe(base_name)
-                  name = f"{clean_base}.{ext}" if ext else clean_base
+                  name = msg.file.name if msg.file and msg.file.name else str(msg.id)
+                  name = safe(name)
 
                   path = f"downloads/{name}"
 
                   if os.path.exists(path):
-                      print(f"⏭️ skip: {name}")
+                      print("skip", name)
                       continue
 
-                  print(f"⬇️ [{i}/{len(posts)}] {name}")
+                  print(f"⬇️ {i}/{len(posts)} {name}")
 
-                  try:
-                      # دانلود فایل
-                      p = await client.download_media(msg, path)
+                  p = await client.download_media(msg, path)
 
-                      if p and os.path.exists(p):
-                          # تقسیم فایل در صورت نیاز
-                          await split_file(p, SPLIT)
-                      else:
-                          print(f"⚠️ download failed: {name}")
-                  except Exception as e:
-                      print(f"❌ error downloading {name}: {e}")
+                  if p:
+                      await split_file(p, SPLIT)
 
               await client.disconnect()
-              print("✅ done")
 
           asyncio.run(main())
 
           EOF
 
-      - name: 🔧 fix large file naming and remove temp files
-        run: |
-          # حذف فایل‌های موقتی ناخواسته
-          find downloads -type f -name "*.part.*" ! -name "*part*" -delete 2>/dev/null || true
-          find downloads -type f -size 0 -delete 2>/dev/null || true
-
-      - name: 🔄 git pull and push with conflict resolve
+      - name: 📤 commit
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # دریافت تغییرات جدید
-          git pull --rebase origin main --autostash || true
-
-          # افزودن فایل‌های دانلود شده
           git add downloads/
 
-          # ساخت commit در صورت وجود تغییر
-          if git diff --staged --quiet; then
-            echo "✅ no new files to commit"
-          else
-            git commit -m "telegram backup $(date '+%Y-%m-%d %H:%M:%S') [skip ci]"
-            git push origin main
-            echo "✅ changes pushed"
-          fi
+          git pull --rebase || true
+
+          git commit -m "telegram backup" || echo "no changes"
+
+          git push
