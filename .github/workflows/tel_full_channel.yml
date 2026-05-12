@@ -1,19 +1,25 @@
-name: دانلود کامل کانال تلگرام (PRO)
+name: دانلود کل چنل
 
 on:
   workflow_dispatch:
     inputs:
-      channel_username:
-        required: true
+      channel:
+        description: 'Telegram channel'
+        required: false
         type: string
-      max_posts:
+        default: 'https://t.me/mychonel'
+
+      limit:
+        description: '0 = all posts'
         required: false
         type: number
         default: 0
-      split_size_mb:
+
+      split_size:
+        description: 'Split size MB (0=no split)'
         required: false
         type: number
-        default: 88
+        default: 90
 
 permissions:
   contents: write
@@ -23,124 +29,292 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 📥 checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: 🐍 install
+      - name: Install
         run: |
-          pip install telethon tqdm
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip git
+          pip3 install telethon
 
-      - name: 📦 download channel
+      - name: Download Channel
         env:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
-          SESSION_STRING: ${{ secrets.SESSION_STRING }}
-          CHANNEL: ${{ github.event.inputs.channel_username }}
-          MAX_POSTS: ${{ github.event.inputs.max_posts }}
-          SPLIT: ${{ github.event.inputs.split_size_mb }}
+          SESSION: ${{ secrets.TG_SESSION }}
+
+          CHANNEL: ${{ github.event.inputs.channel }}
+          LIMIT: ${{ github.event.inputs.limit }}
+          SPLIT_SIZE: ${{ github.event.inputs.split_size }}
+
+          TARGET_USER: ${{ secrets.TARGET_USER }}
+          TARGET_TOKEN: ${{ secrets.TARGET_TOKEN }}
+          TARGET_REPO: ${{ secrets.TARGET_REPO }}
 
         run: |
+
           python3 << 'EOF'
 
+          import asyncio
           import os
           import re
+          import time
           import math
-          import asyncio
+          import shutil
+          import subprocess
+          import hashlib
+
           from telethon import TelegramClient
           from telethon.sessions import StringSession
+          from telethon.tl.types import DocumentAttributeFilename
 
           API_ID = int(os.environ["API_ID"])
           API_HASH = os.environ["API_HASH"]
-          SESSION = os.environ["SESSION_STRING"]
+          SESSION = os.environ["SESSION"]
 
-          CHANNEL = os.environ["CHANNEL"]
-          MAX_POSTS = int(os.environ["MAX_POSTS"])
-          SPLIT = int(os.environ["SPLIT"])
+          CHANNEL = os.environ["CHANNEL"] or "https://t.me/mychonel"
+          LIMIT = int(os.environ["LIMIT"])
+          SPLIT_SIZE = int(os.environ["SPLIT_SIZE"])
 
-          def safe(n):
-              return re.sub(r'[\\/*?:"<>|]', "_", n)
+          TARGET_USER = os.environ["TARGET_USER"]
+          TARGET_TOKEN = os.environ["TARGET_TOKEN"]
+          TARGET_REPO = os.environ["TARGET_REPO"]
 
-          async def split_file(path, limit_mb):
-              size = os.path.getsize(path)
-              limit = limit_mb * 1024 * 1024
+          os.makedirs("downloads", exist_ok=True)
 
-              if size <= limit:
-                  return [path]
+          push_lock = asyncio.Lock()
+          split_lock = asyncio.Lock()
 
-              parts = math.ceil(size / limit)
-              out = []
+          downloaded_count = 0
+          last_push_success = True   # ✅ FIX ADD
 
-              with open(path, "rb") as f:
-                  for i in range(parts):
-                      p = f"{path}.part{i+1:03d}"
-                      out.append(p)
+          def safe(name):
+              return re.sub(r'[\\/*?:"<>|]', "_", name)
 
-                      with open(p, "wb") as o:
-                          left = limit
-                          while left > 0:
-                              chunk = f.read(min(left, 1024*1024))
-                              if not chunk:
-                                  break
-                              o.write(chunk)
-                              left -= len(chunk)
+          def short_hash(text):
+              return hashlib.md5(text.encode()).hexdigest()[:6]
 
-              os.remove(path)
-              return out
+          def get_filename(msg, msg_id):
+
+              base = None
+
+              if hasattr(msg, "file") and msg.file and getattr(msg.file, "name", None):
+                  base = msg.file.name
+
+              if msg.document:
+                  for attr in msg.document.attributes:
+                      if isinstance(attr, DocumentAttributeFilename):
+                          base = attr.file_name
+
+              if msg.video:
+                  ext = msg.file.ext if msg.file and msg.file.ext else ".mp4"
+                  base = f"{msg_id}{ext}"
+
+              if msg.audio:
+                  ext = msg.file.ext if msg.file and msg.file.ext else ".mp3"
+                  base = f"{msg_id}{ext}"
+
+              if msg.file and not base:
+                  ext = msg.file.ext if msg.file.ext else ".bin"
+                  base = f"{msg_id}{ext}"
+
+              if not base:
+                  base = f"{msg_id}.bin"
+
+              base = safe(base)
+
+              if os.path.exists("downloads/" + base):
+                  name, ext = os.path.splitext(base)
+                  base = f"{name}_{short_hash(str(msg_id))}{ext}"
+
+              return base
+
+          async def split_file(path):
+
+              async with split_lock:
+
+                  if not os.path.exists(path):
+                      return False
+
+                  if SPLIT_SIZE == 0:
+                      return True
+
+                  size = os.path.getsize(path)
+                  limit = SPLIT_SIZE * 1024 * 1024
+
+                  if size <= limit:
+                      return True
+
+                  parts = []
+                  total = math.ceil(size / limit)
+
+                  with open(path, "rb") as f:
+
+                      for i in range(total):
+
+                          part = f"{path}.part{i+1:03d}"
+
+                          with open(part, "wb") as out:
+                              remaining = limit
+
+                              while remaining > 0:
+                                  chunk = f.read(min(1024*1024, remaining))
+                                  if not chunk:
+                                      break
+                                  out.write(chunk)
+                                  remaining -= len(chunk)
+
+                          parts.append(part)
+
+                  os.remove(path)
+                  return True
+
+          async def git_push():
+
+              global last_push_success
+
+              async with push_lock:
+
+                  print("\n🚀 pushing...")
+
+                  if os.path.exists("storage_repo"):
+                      shutil.rmtree("storage_repo")
+
+                  subprocess.run([
+                      "git","clone","--depth=1",
+                      f"https://{TARGET_USER}:{TARGET_TOKEN}@github.com/{TARGET_USER}/{TARGET_REPO}.git",
+                      "storage_repo"
+                  ], check=True)
+
+                  os.makedirs("storage_repo/downloads", exist_ok=True)
+
+                  subprocess.run("cp -r downloads/* storage_repo/downloads/ 2>/dev/null || true", shell=True)
+
+                  os.chdir("storage_repo")
+
+                  subprocess.run(["git","config","user.name","bot"])
+                  subprocess.run(["git","config","user.email","bot@users.noreply.github.com"])
+
+                  subprocess.run(["git","add","."])
+                  subprocess.run(["git","commit","-m","auto"], check=False)
+
+                  result = subprocess.run(["git","push","origin","main"], check=False)
+
+                  os.chdir("..")
+
+                  last_push_success = (result.returncode == 0)
+
+                  print("✅ push done:", last_push_success)
+
+          async def delete_from_channel(client, msg):
+              try:
+                  await client.delete_messages(msg.chat_id, msg.id)
+                  print(f"🗑 deleted {msg.id}")
+              except Exception as e:
+                  print(f"⚠️ delete failed: {e}")
+
+          async def process_one(client, msg, i, total):
+
+              global downloaded_count
+
+              if not msg.media:
+                  return
+
+              name = get_filename(msg, msg.id)
+              path = f"downloads/{name}"
+
+              if os.path.exists(path):
+                  print(f"⏭️ skip {name}")
+                  return
+
+              print(f"\n⬇️ [{i}/{total}] {name}")
+
+              start = time.time()
+              last = 0
+
+              def progress(cur, total_size):
+
+                  nonlocal last
+
+                  if time.time() - last < 0.3:
+                      return
+
+                  last = time.time()
+
+                  if total_size == 0:
+                      return
+
+                  percent = cur * 100 / total_size
+                  speed = cur / (time.time() - start + 0.001) / 1024 / 1024
+
+                  print(
+                      f"\r📥 {name} | {percent:.1f}% | {speed:.2f}MB/s",
+                      end="",
+                      flush=True
+                  )
+
+              try:
+
+                  await client.download_media(msg, file=path, progress_callback=progress)
+
+                  print("\n✅ downloaded")
+
+                  ok = await split_file(path)
+
+                  if ok:
+                      downloaded_count += 1
+
+                      if downloaded_count % 5 == 0:
+                          await git_push()
+
+                      # ✅ FIXED DELETE LOGIC
+                      if last_push_success:
+                          await delete_from_channel(client, msg)
+                      else:
+                          print("⚠️ skip delete (push failed)")
+
+              except Exception as e:
+                  print(f"\n❌ error {e}")
 
           async def main():
-              client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
+
+              client = TelegramClient(
+                  StringSession(SESSION),
+                  API_ID,
+                  API_HASH
+              )
 
               await client.start()
 
-              print("✅ connected")
-
               entity = await client.get_entity(CHANNEL)
 
-              posts = []
+              messages = await client.get_messages(
+                  entity,
+                  limit=None if LIMIT == 0 else LIMIT
+              )
 
-              print("🔄 reading messages...")
+              messages = [m for m in messages if m.media]
 
-              async for msg in client.iter_messages(entity, limit=MAX_POSTS or None):
-                  if msg.file:
-                      posts.append(msg)
+              total = len(messages)
 
-              print("📦 files:", len(posts))
+              print(f"📦 {total} media posts")
 
-              os.makedirs("downloads", exist_ok=True)
+              sem = asyncio.Semaphore(3)
 
-              for i, msg in enumerate(posts, 1):
+              async def worker(msg, i):
+                  async with sem:
+                      await process_one(client, msg, i, total)
 
-                  name = msg.file.name if msg.file and msg.file.name else str(msg.id)
-                  name = safe(name)
-
-                  path = f"downloads/{name}"
-
-                  if os.path.exists(path):
-                      print("skip", name)
-                      continue
-
-                  print(f"⬇️ {i}/{len(posts)} {name}")
-
-                  p = await client.download_media(msg, path)
-
-                  if p:
-                      await split_file(p, SPLIT)
+              await asyncio.gather(*[
+                  worker(msg, i+1)
+                  for i, msg in enumerate(reversed(messages))
+              ])
 
               await client.disconnect()
+              await git_push()
+
+              print("\n🎉 DONE")
 
           asyncio.run(main())
 
           EOF
-
-      - name: 📤 commit
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          git add downloads/
-
-          git pull --rebase || true
-
-          git commit -m "telegram backup" || echo "no changes"
-
-          git push
