@@ -1,0 +1,185 @@
+name: Telegram Bulk Downloader → Storage Repo
+
+on:
+  workflow_dispatch:
+    inputs:
+      links:
+        description: 'Telegram links separated by ;'
+        required: true
+        type: string
+      split_size:
+        description: 'Split size MB (0 = no split)'
+        required: false
+        type: number
+        default: 90
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout storage repo
+        uses: actions/checkout@v4
+
+      - name: 🐍 Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 python3-pip git
+          pip3 install telethon
+
+      - name: 🚀 Download Telegram files
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          LINKS: ${{ github.event.inputs.links }}
+          SPLIT_SIZE: ${{ github.event.inputs.split_size }}
+        run: |
+          python3 << 'EOF'
+          import asyncio
+          import os
+          import re
+          import time
+          import math
+          import shutil
+          from telethon import TelegramClient
+          from telethon.tl.types import DocumentAttributeFilename
+
+          API_ID = int(os.environ['API_ID'])
+          API_HASH = os.environ['API_HASH']
+          BOT_TOKEN = os.environ['BOT_TOKEN']
+          CHANNEL_ID = int(os.environ['CHANNEL_ID'])
+          LINKS = [x.strip() for x in os.environ['LINKS'].split(';') if x.strip()]
+          SPLIT_SIZE = int(os.environ['SPLIT_SIZE'])
+
+          # استفاده از پوشه download_temp برای دانلود موقت
+          TEMP_DIR = "download_temp"
+          FINAL_DIR = "downloads"
+          
+          os.makedirs(TEMP_DIR, exist_ok=True)
+          os.makedirs(FINAL_DIR, exist_ok=True)
+
+          def extract_id(link):
+              m = re.search(r'/(\d+)$', link)
+              return int(m.group(1)) if m else None
+
+          def safe(name):
+              return re.sub(r'[\\/*?:"<>|]', "_", name)
+
+          def get_filename(msg, msg_id):
+              if hasattr(msg, 'file') and msg.file and hasattr(msg.file, 'name') and msg.file.name:
+                  if msg.file.name.endswith(('.mp4', '.mkv', '.jpg', '.png', '.pdf', '.zip', '.rar')):
+                      return msg.file.name
+              if msg.document:
+                  for attr in msg.document.attributes:
+                      if isinstance(attr, DocumentAttributeFilename) and attr.file_name:
+                          if attr.file_name.endswith(('.mp4', '.mkv', '.jpg', '.png', '.pdf', '.zip', '.rar')):
+                              return attr.file_name
+                          if '.' in attr.file_name:
+                              return attr.file_name
+              if hasattr(msg, 'media') and msg.media:
+                  if hasattr(msg.media, 'document'):
+                      for attr in msg.media.document.attributes:
+                          if isinstance(attr, DocumentAttributeFilename) and attr.file_name:
+                              return attr.file_name
+              if msg.video:
+                  ext = msg.file.ext if msg.file and msg.file.ext else ".mp4"
+                  return f"{msg_id}{ext}"
+              if msg.audio:
+                  ext = msg.file.ext if msg.file and msg.file.ext else ".mp3"
+                  return f"{msg_id}{ext}"
+              if msg.file:
+                  ext = msg.file.ext if msg.file.ext else ".bin"
+                  return f"{msg_id}{ext}"
+              return f"{msg_id}.bin"
+
+          async def split_file(path, target_dir):
+              if SPLIT_SIZE == 0:
+                  dest = os.path.join(target_dir, os.path.basename(path))
+                  shutil.move(path, dest)
+                  return [dest]
+              limit = SPLIT_SIZE * 1024 * 1024
+              size = os.path.getsize(path)
+              if size <= limit:
+                  dest = os.path.join(target_dir, os.path.basename(path))
+                  shutil.move(path, dest)
+                  return [dest]
+              parts = []
+              total = math.ceil(size / limit)
+              base_name = os.path.basename(path)
+              with open(path, "rb") as f:
+                  for i in range(total):
+                      part_name = f"{base_name}.part{i+1:03d}"
+                      part_path = os.path.join(target_dir, part_name)
+                      with open(part_path, "wb") as out:
+                          remaining = limit
+                          while remaining > 0:
+                              chunk = f.read(min(1024*1024, remaining))
+                              if not chunk:
+                                  break
+                              out.write(chunk)
+                              remaining -= len(chunk)
+                      parts.append(part_path)
+              os.remove(path)
+              return parts
+
+          async def download(client, link, i, total):
+              msg_id = extract_id(link)
+              if not msg_id:
+                  print("❌ invalid link")
+                  return
+              msg = await client.get_messages(CHANNEL_ID, ids=msg_id)
+              if not msg or not msg.media:
+                  print("⚠️ no media")
+                  return
+              name = safe(get_filename(msg, msg_id))
+              temp_path = os.path.join(TEMP_DIR, name)
+              if os.path.exists(temp_path):
+                  print(f"⏭️ skip: {name}")
+                  return
+              print(f"\n⬇️ [{i}/{total}] {name}")
+              start = time.time()
+              def progress(cur, total_size):
+                  if total_size == 0:
+                      return
+                  percent = cur / total_size * 100
+                  speed = cur / (time.time() - start + 0.1) / 1024 / 1024
+                  print(f"\r📥 {name} | {percent:.1f}% | {cur/1024/1024:.1f}/{total_size/1024/1024:.1f}MB | {speed:.2f} MB/s", end="")
+              await client.download_media(msg, file=temp_path, progress_callback=progress)
+              print("\n✅ done")
+              await split_file(temp_path, FINAL_DIR)
+
+          async def main():
+              client = TelegramClient("session", API_ID, API_HASH)
+              await client.start(bot_token=BOT_TOKEN)
+              total = len(LINKS)
+              print(f"📦 {total} links")
+              sem = asyncio.Semaphore(3)
+              async def wrap(l, i):
+                  async with sem:
+                      await download(client, l, i, total)
+              await asyncio.gather(*[wrap(l, i+1) for i, l in enumerate(LINKS)])
+              await client.disconnect()
+          asyncio.run(main())
+          EOF
+
+      - name: 📤 Commit and push directly to storage repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # اضافه کردن فایل‌های جدید
+          git add downloads/
+          
+          # اگر فایل جدیدی وجود داشت، commit و push کن
+          if git diff --staged --quiet; then
+            echo "✅ فایل جدیدی برای commit وجود ندارد"
+          else
+            git commit -m "Add Telegram files [skip ci]"
+            git push origin main
+            echo "✅ فایل‌ها با موفقیت به مخزن storage اضافه شدند"
+          fi
