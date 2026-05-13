@@ -19,23 +19,71 @@ jobs:
       - name: 📂 Checkout
         uses: actions/checkout@v4
 
-      - name: 🔍 Set filename
+      - name: 🔧 Set variables and filename
         id: vars
         run: |
           EXT_ID="${{ github.event.inputs.extension_id }}"
-          DOWNLOAD_URL="https://clients2.google.com/service/update2/crx?response=redirect&prodversion=100&acceptformat=crx2,crx3&x=id%3D${EXT_ID}%26uc"
-          echo "download_url=${DOWNLOAD_URL}" >> $GITHUB_OUTPUT
+          # لینک دانلود مستقیم با User-Agent در curl استفاده میشه
+          echo "extension_id=${EXT_ID}" >> $GITHUB_OUTPUT
           echo "filename=foxyproxy-${EXT_ID}.crx" >> $GITHUB_OUTPUT
 
-      - name: ⬇️ Download .crx file
+      - name: ⬇️ Download .crx file with proper User-Agent
         run: |
-          curl -L -o "${{ steps.vars.outputs.filename }}" "${{ steps.vars.outputs.download_url }}"
-          echo "✅ Downloaded: ${{ steps.vars.outputs.filename }}"
+          EXT_ID="${{ steps.vars.outputs.extension_id }}"
+          FILENAME="${{ steps.vars.outputs.filename }}"
+          
+          # لینک دانلود با فرمت صحیح
+          URL="https://clients2.google.com/service/update2/crx?response=redirect&prodversion=131.0.6778.86&acceptformat=crx2,crx3&x=id%3D${EXT_ID}%26installsource%3Dondemand%26uc"
+          
+          echo "📥 Downloading from: $URL"
+          
+          # دانلود با User-Agent واقعی و ریدایرکت
+          curl -L --fail \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36" \
+            -H "Accept: application/x-chrome-extension" \
+            -o "$FILENAME" \
+            "$URL"
+          
+          # بررسی حجم فایل
+          SIZE=$(stat -c%s "$FILENAME" 2>/dev/null || stat -f%z "$FILENAME" 2>/dev/null)
+          
+          if [ -f "$FILENAME" ] && [ "$SIZE" -gt 1000 ]; then
+            echo "✅ Downloaded: $FILENAME ($((SIZE / 1024)) KB)"
+          else
+            echo "❌ Download failed or file is empty ($SIZE bytes)"
+            echo "Trying alternative method..."
+            
+            # روش جایگزین: دانلود از وب‌استور با فرمت ZIP
+            ALT_URL="https://clients2.google.com/service/update2/crx?response=redirect&prodversion=100&acceptformat=zip&x=id%3D${EXT_ID}%26uc"
+            curl -L --fail \
+              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+              -o "${FILENAME}.zip" \
+              "$ALT_URL"
+            
+            ZIP_SIZE=$(stat -c%s "${FILENAME}.zip" 2>/dev/null || stat -f%z "${FILENAME}.zip" 2>/dev/null)
+            
+            if [ -f "${FILENAME}.zip" ] && [ "$ZIP_SIZE" -gt 1000 ]; then
+              echo "✅ Downloaded as ZIP: ${FILENAME}.zip ($((ZIP_SIZE / 1024)) KB)"
+              mv "${FILENAME}.zip" "$FILENAME"
+            else
+              echo "❌ Both methods failed. Extension may not exist or requires authentication."
+              exit 1
+            fi
+          fi
 
       - name: 📤 Upload to GitHub
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${{ steps.vars.outputs.filename }}"
-          git commit -m "Add ${{ steps.vars.outputs.filename }} [skip ci]" || echo "No changes to commit"
-          git push
+          
+          FILENAME="${{ steps.vars.outputs.filename }}"
+          
+          if [ -f "$FILENAME" ]; then
+            git add "$FILENAME"
+            git commit -m "Add $FILENAME [skip ci]" || echo "No changes to commit"
+            git push
+            echo "✅ File uploaded to repository"
+          else
+            echo "❌ No file to upload"
+            exit 1
+          fi
