@@ -235,7 +235,7 @@ jobs:
         run: |
           set -e
           ENTRIES_JSON='${{ steps.parse.outputs.ENTRIES_JSON }}'
-          OUTPUT_FOLDER="dl"
+          OUTPUT_FOLDER="youtube"
           mkdir -p "$OUTPUT_FOLDER"
           
           # Global defaults from the workflow inputs (video quality default is now 1080)
@@ -327,7 +327,7 @@ jobs:
           FAILED_ENTRIES='${{ steps.primary_download.outputs.FAILED_ENTRIES_JSON }}'
           count=$(echo "$FAILED_ENTRIES" | jq length)
           echo "🔄 Attempting fallback for $count failed entries..."
-          OUTPUT_FOLDER="dl"
+          OUTPUT_FOLDER="youtube"
           
           # Helper for filename suffix
           build_suffix() {
@@ -662,7 +662,7 @@ jobs:
         id: verify
         run: |
           set -e
-          OUTPUT_FOLDER="dl"
+          OUTPUT_FOLDER="youtube"
           THRESH_MB=99
           THRESH_BYTES=$((THRESH_MB * 1024 * 1024))
 
@@ -703,7 +703,7 @@ jobs:
       - name: '📤 Commit & Push Changes'
         run: |
           set -e
-          OUTPUT_FOLDER="dl"
+          OUTPUT_FOLDER="youtube"
           FILE_COUNT="${{ steps.verify.outputs.file_count }}"
 
           if [ "$FILE_COUNT" -eq 0 ]; then
