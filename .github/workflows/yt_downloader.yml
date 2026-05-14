@@ -235,7 +235,7 @@ jobs:
         run: |
           set -e
           ENTRIES_JSON='${{ steps.parse.outputs.ENTRIES_JSON }}'
-          OUTPUT_FOLDER="youtube"
+          OUTPUT_FOLDER="dl"
           mkdir -p "$OUTPUT_FOLDER"
           
           # Global defaults from the workflow inputs (video quality default is now 1080)
